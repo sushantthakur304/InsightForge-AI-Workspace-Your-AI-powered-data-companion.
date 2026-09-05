@@ -1,0 +1,22 @@
+Order ID,Order Date,Region,Product,Customer Email,Phone,Sales Amount,Quantity,Discount %,Customer Segment,Sales Rep,Notes
+1001,2026-01-05,North,Laptop,alex@example.com,+1 415 555 0101,"$1,250.00",2,5%,Enterprise, Priya Shah , urgent delivery
+1002,01/07/2026,north,Laptop,bella@example.com,+1 415 555 0102,"$1,250.00",2,5%,enterprise,Priya Shah,repeat purchase
+1003,2026/01/09,West,Monitor,carlos@example.com,+1 415 555 0103,$399.00,1,0%,SMB,Leo Martin,
+1004,not-a-date,West,Monitor,dina@example.com,+1 415 555 0104,$399.00,1,0%,smb,Leo Martin,invalid date
+1005,2026-02-02,South,Keyboard,eli@example.com,+1 415 555 0105,$79.00,5,10%,Consumer,Ana Rao, 
+1006,2026-02-11,South,Keyboard,farah@example.com,+1 415 555 0106,$79.00,,10%,consumer,Ana Rao,missing quantity
+1007,2026-02-18,East,Subscription,gita@example.com,+1 415 555 0107,$49.00,10,15%,SMB,Noah Kim,monthly plan
+1007,2026-02-18,East,Subscription,gita@example.com,+1 415 555 0107,$49.00,10,15%,SMB,Noah Kim,monthly plan
+1008,2026-03-01,East,Subscription,henry@example.com,+1 415 555 0108,$49.00,11,15%,smb,Noah Kim,monthly plan
+1009,2026-03-04,North,Server,irene@example.com,+1 415 555 0109,"$8,500.00",1,2%,Enterprise, Priya Shah ,high value
+1010,2026-03-12,West,Server,jamal@example.com,+1 415 555 0110,"$99,999.00",1,2%,Enterprise,Leo Martin,outlier
+1011,2026-03-18,South,Laptop,kara@example.com,+1 415 555 0111,"$1,250.00",-1,5%,Consumer,Ana Rao,negative quantity
+1012,2026-04-02,North,Monitor,liam@example.com,+1 415 555 0112,$399.00,3,,Enterprise,Priya Shah,missing discount
+1013,2026-04-08,East,Keyboard,maya@example.com,+1 415 555 0113,$79.00,4,10%,Consumer,Noah Kim,normal
+1014,2026-04-20,West,Subscription,noor@example.com,+1 415 555 0114,$49.00,18,15%,SMB,Leo Martin,large subscription qty
+1015,2099-01-01,South,Monitor,omar@example.com,+1 415 555 0115,$399.00,2,0%,Consumer,Ana Rao,future date
+1016,2026-05-04,North,Laptop,pia@example.com,+1 415 555 0116,"$1,250.00",2,5%,ENTERPRISE,Priya Shah,caps category
+1017,2026-05-11,West,Keyboard,quinn@example.com,+1 415 555 0117,$79.00,4,10%,SMB,Leo Martin,normal
+1018,2026-05-13,East,Monitor,ria@example.com,+1 415 555 0118,$399.00,2,0%,SMB,Noah Kim,normal
+1019,2026-05-16,,Laptop,sam@example.com,+1 415 555 0119,"$1,250.00",2,5%,Consumer,Ana Rao,missing region
+

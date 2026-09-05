@@ -1,0 +1,17 @@
+streamlit>=1.63.0
+pandas>=2.2
+polars>=1.0
+numpy>=1.26
+scipy>=1.12
+scikit-learn>=1.4
+openpyxl>=3.1
+xlsxwriter>=3.2
+xlrd>=2.0
+pyarrow>=16.0
+plotly>=5.22
+kaleido>=0.2.1
+reportlab>=4.2
+pydantic>=2.7
+python-dotenv>=1.0
+openai>=1.40
+pytest>=8.2
