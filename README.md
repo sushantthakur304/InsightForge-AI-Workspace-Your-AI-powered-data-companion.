@@ -31,6 +31,7 @@ Screenshots can be added after running the app locally with `sample_data/messy_s
 - Pydantic
 - Pytest
 - SQLite
+- Supabase (optional production backend: Postgres, Storage, and row-level access control)
 
 ## Architecture
 
@@ -137,6 +138,22 @@ pytest
 
 The current test suite covers ingestion, profiling, quality checks, cleaning/audit behavior, statistics, deterministic insight fallback, exports, and Streamlit app initialization.
 
+## Production workspaces (Supabase)
+
+For a multi-user deployment, InsightForge uses **Supabase** as the production foundation: private object storage for files, PostgreSQL for project history, and database-enforced workspace roles. Local SQLite and the local dataset directory remain the default for development.
+
+1. Create a Supabase project and apply [the production migration](supabase/migrations/20260908_production_workspaces.sql).
+2. Create an OIDC application with your identity provider (Google Workspace, Microsoft Entra ID, Okta, or Auth0) and configure Streamlit's `[auth]` settings from `.streamlit/secrets.example.toml`.
+3. Store the following only in the deployment secret manager: `INSIGHTFORGE_STORAGE_BACKEND=supabase`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY`.
+4. Start a separate worker process with `python -m workers.production_worker`. Files at or above `INSIGHTFORGE_BACKGROUND_FILE_THRESHOLD_MB` are queued for background profiling. Schedule `refresh_dataset` jobs only from hosts in `INSIGHTFORGE_REFRESH_ALLOWED_HOSTS`.
+
+The service-role key never reaches a browser. The app first verifies the Streamlit OIDC identity, then confirms that identity's workspace membership before any server-side Supabase operation. The migration also enables row-level policies for direct Supabase clients and team roles: owner, admin, editor, and viewer.
+
+### Accuracy checks and validation policies
+
+- The cleaning step now offers baseline, retail, finance, healthcare operations, marketing, and supply-chain policy templates. Templates add only rules that match columns in the uploaded dataset.
+- Configure trusted HTTPS reference sources through `INSIGHTFORGE_REFERENCE_CHECKS_JSON` (example in `.env.example`). A mismatch is a review signal with source provenance, never an unsupported real-world accuracy claim.
+
 ## Deploy Online
 
 This project is ready for Streamlit Community Cloud or any Python app host that supports Streamlit.
@@ -160,7 +177,7 @@ streamlit run streamlit_app.py --server.port=$PORT --server.address=0.0.0.0 --se
 
 ### Cloud Storage Note
 
-The built-in dataset library stores files on the app server disk under `data/`. That is permanent enough for local use and some single-server deployments, but public cloud platforms can reset local disk on restart or redeploy. For production multi-user use, connect the dataset library to durable external storage such as S3, Google Cloud Storage, Supabase, or PostgreSQL-backed object storage.
+The built-in dataset library stores files on the app server disk under `data/` in local mode. For production multi-user deployments, enable the Supabase workspace backend above instead of relying on server disk or SQLite.
 
 ## Supported File Types
 
@@ -187,9 +204,6 @@ InsightForge AI processes files locally by default. When dataset library storage
 
 ## Future Roadmap
 
-- FastAPI service layer with authenticated analysis jobs.
-- React/Next.js frontend.
-- Persistent workspace projects and analysis history.
-- Richer validation-rule builder and reusable policy templates.
-- Reference-data checks for real-world accuracy validation.
-- Role-based governance, sharing, and scheduled refreshes.
+- Workspace invitation and member-management screens.
+- Additional managed data connectors for scheduled refreshes.
+- FastAPI service layer and React/Next.js frontend for high-volume deployments.

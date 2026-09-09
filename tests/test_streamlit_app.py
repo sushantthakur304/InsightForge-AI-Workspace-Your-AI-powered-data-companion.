@@ -48,6 +48,28 @@ def test_profile_page_shows_readable_dataset_details():
     assert "file_name" not in rendered_details
 
 
+def test_analytics_dashboard_is_available_after_upload():
+    project_root = Path(__file__).resolve().parents[1]
+    app_path = project_root / "app.py"
+    csv_path = project_root / "sample_data" / "messy_sales_data.csv"
+
+    app = AppTest.from_file(str(app_path), default_timeout=30).run()
+    app.toggle(key="save_upload_permanently").set_value(False).run()
+    app.file_uploader[0].upload(csv_path.name, csv_path.read_bytes(), "text/csv").run()
+    app.button(key="load_uploaded_dataset").click().run()
+    app.radio[0].set_value(6).run()
+
+    assert not app.exception
+    assert any("Business Analytics Dashboard" == item.value for item in app.subheader)
+
+    initial_rows = next(item.value for item in app.metric if item.label == "Total records")
+    app.multiselect(key="analytics_filter_values_Region").set_value(["West"]).run()
+    assert next(item.value for item in app.metric if item.label == "Total records") == "5"
+
+    app.button(key="analytics_clear_filters").click().run()
+    assert next(item.value for item in app.metric if item.label == "Total records") == initial_rows
+
+
 def test_upload_can_save_to_permanent_dataset_library(tmp_path, monkeypatch):
     monkeypatch.setenv("INSIGHTFORGE_STORAGE_DB", str(tmp_path / "library.sqlite3"))
     monkeypatch.setenv("INSIGHTFORGE_STORAGE_DIR", str(tmp_path / "datasets"))

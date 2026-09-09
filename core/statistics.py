@@ -23,8 +23,29 @@ class PreparedAnalysisFrame:
     boolean: list[str]
 
 
+def _make_analysis_column_names_unique(columns: pd.Index) -> list[str]:
+    """Keep analysis libraries safe when a spreadsheet has repeated headers."""
+
+    used: set[str] = set()
+    counts: dict[str, int] = {}
+    unique: list[str] = []
+    for raw_name in columns:
+        base = str(raw_name)
+        count = counts.get(base, 0)
+        candidate = base if count == 0 else f"{base} ({count + 1})"
+        while candidate in used:
+            count += 1
+            candidate = f"{base} ({count + 1})"
+        counts[base] = count + 1
+        used.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
 def prepare_analysis_frame(df: pd.DataFrame) -> PreparedAnalysisFrame:
     prepared = df.copy()
+    if prepared.columns.duplicated().any():
+        prepared.columns = _make_analysis_column_names_unique(prepared.columns)
     groups = classify_columns(prepared)
     for column in groups["numeric_text"]:
         prepared[column] = parse_numeric_series(prepared[column])
@@ -251,7 +272,7 @@ def _inferential_tests(df: pd.DataFrame, numerical: list[str], categorical: list
 
     if len(numerical) >= 2:
         corr = df[numerical].corr(numeric_only=True).abs()
-        pairs = corr.where(~np.eye(corr.shape[0], dtype=bool)).stack().sort_values(ascending=False)
+        pairs = corr.where(~np.eye(corr.shape[0], dtype=bool)).stack().dropna().sort_values(ascending=False)
         if not pairs.empty:
             x, y = pairs.index[0]
             temp = df[[x, y]].dropna()

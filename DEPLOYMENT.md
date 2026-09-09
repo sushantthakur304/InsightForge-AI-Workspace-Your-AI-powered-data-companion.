@@ -26,8 +26,22 @@ For hosts that do not use `Procfile`, set the start command manually:
 streamlit run streamlit_app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
 ```
 
-## Dataset Storage Note
+## Production multi-user deployment
 
-The app has local dataset storage under `data/` by default. On a public cloud service, that server disk may reset when the app restarts, redeploys, or moves machines. For real permanent multi-user storage, connect the dataset library to an external service such as S3, Google Cloud Storage, Supabase, or PostgreSQL-backed object storage.
+Use Supabase for production workspaces. It supplies private object storage, managed PostgreSQL, and row-level policies for owner, admin, editor, and viewer roles.
+
+1. Apply `supabase/migrations/20260908_production_workspaces.sql` to a new Supabase project.
+2. Add the following deployment secrets (never commit them):
+
+```text
+INSIGHTFORGE_STORAGE_BACKEND=supabase
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=server-only-service-role-key
+```
+
+3. Configure a real OIDC provider under `[auth]` in Streamlit secrets. The redirect URL must end in `/oauth2callback` and match the identity-provider registration.
+4. Run `python -m workers.production_worker` as a separate worker service. It handles queued large-file profiling and approved scheduled refresh jobs. Set `INSIGHTFORGE_REFRESH_ALLOWED_HOSTS` to a comma-separated allowlist before enabling any refresh connector.
+
+The app will not enable Supabase storage until both the service secrets and a verified user identity are present. Local mode continues to use `data/` and SQLite, which is suitable only for single-user development.
 
 Do not commit `.env`, `.streamlit/secrets.toml`, `data/`, or uploaded customer files.

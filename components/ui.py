@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import html
+from pathlib import Path
 
 import streamlit as st
 
@@ -36,15 +38,32 @@ STEP_META = [
         "Download Files",
         "Download reports, cleaned data, and audit logs.",
     ),
+    (
+        "analytics",
+        "Analytics Dashboard",
+        "Review interactive KPIs, trends, quality, and detailed data.",
+    ),
 ]
 
 STEP_LABELS = [step[1] for step in STEP_META]
 
 
-def inject_global_styles(theme_mode: str = "Light", font_style: str = "Inter") -> None:
+def render_sidebar_brand() -> None:
+    """Render the uploaded InsightForge identity at the top of the sidebar."""
+    logo_path = Path(__file__).resolve().parents[1] / "assets" / "insightforge-logo.png"
+    logo_data = base64.b64encode(logo_path.read_bytes()).decode("ascii")
+    st.html(
+        f"""
+        <div class="if-sidebar-brand" aria-label="InsightForge AI Workspace">
+            <img class="if-sidebar-brand-image" src="data:image/png;base64,{logo_data}" alt="InsightForge AI Workspace logo">
+        </div>
+        """
+    )
+
+
+def inject_global_styles(theme_mode: str = "Light") -> None:
     dark = theme_mode.lower() == "dark"
-    preferred_font = "Poppins" if font_style == "Poppins" else "Inter"
-    body_font = f'"{preferred_font}", "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+    body_font = '"Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
     heading_font = '"Poppins", "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
 
     background = "#0b1020" if dark else "#f7f8fb"
@@ -186,6 +205,19 @@ def inject_global_styles(theme_mode: str = "Light", font_style: str = "Inter") -
 
         [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {{
             color: {"#bdc9d9" if dark else "#6b7280"};
+        }}
+
+        .if-sidebar-brand {{
+            margin: 0.15rem 0 0.9rem;
+            background: transparent;
+            border: 0;
+            box-shadow: none;
+        }}
+
+        .if-sidebar-brand-image {{
+            display: block;
+            width: 100%;
+            height: auto;
         }}
 
         [translate="no"][data-testid*="Icon"],

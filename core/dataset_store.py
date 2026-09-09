@@ -13,6 +13,14 @@ from typing import Any
 from core.ingestion import IngestionResult, load_dataset
 
 
+def _remote_gateway():
+    """Return the configured production gateway, if production storage is on."""
+
+    from core.production import active_gateway
+
+    return active_gateway()
+
+
 def default_storage_dir() -> Path:
     return Path(os.getenv("INSIGHTFORGE_STORAGE_DIR", "data/datasets"))
 
@@ -43,7 +51,11 @@ class StoredDatasetRecord:
 def init_dataset_store(
     db_path: str | Path | None = None,
     storage_dir: str | Path | None = None,
-) -> Path:
+) -> Path | None:
+    gateway = _remote_gateway()
+    if gateway is not None:
+        gateway.require_workspace()
+        return None
     resolved_db_path = Path(db_path) if db_path is not None else default_db_path()
     resolved_storage_dir = Path(storage_dir) if storage_dir is not None else default_storage_dir()
     resolved_storage_dir.mkdir(parents=True, exist_ok=True)
@@ -103,6 +115,38 @@ def _record_from_row(row: sqlite3.Row) -> StoredDatasetRecord:
     )
 
 
+def _record_from_remote(payload: dict[str, Any]) -> StoredDatasetRecord:
+    """Convert Supabase's JSON response into the existing storage record model."""
+
+    def json_value(value: Any, fallback: Any) -> Any:
+        if value is None:
+            return fallback
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return fallback
+        return value
+
+    return StoredDatasetRecord(
+        id=str(payload["id"]),
+        created_at=str(payload.get("created_at") or _utc_now()),
+        updated_at=str(payload.get("updated_at") or payload.get("created_at") or _utc_now()),
+        last_loaded_at=payload.get("last_loaded_at"),
+        file_name=str(payload["file_name"]),
+        file_type=str(payload.get("file_type") or ""),
+        size_bytes=int(payload.get("size_bytes") or 0),
+        row_count=int(payload.get("row_count") or 0),
+        column_count=int(payload.get("column_count") or 0),
+        available_sheets=list(json_value(payload.get("available_sheets"), [])),
+        selected_sheets=list(json_value(payload.get("selected_sheets"), [])),
+        active_sheet=str(payload.get("active_sheet") or ""),
+        combined=bool(payload.get("combined")),
+        storage_path=str(payload.get("storage_key") or ""),
+        context=dict(json_value(payload.get("context"), {})),
+    )
+
+
 def _resolve_storage_path(path: str | Path, storage_dir: str | Path | None = None) -> Path:
     resolved_storage_dir = (Path(storage_dir) if storage_dir is not None else default_storage_dir()).resolve()
     resolved_path = Path(path).resolve()
@@ -120,7 +164,25 @@ def save_dataset_bytes(
     db_path: str | Path | None = None,
     storage_dir: str | Path | None = None,
 ) -> StoredDatasetRecord:
+    gateway = _remote_gateway()
+    if gateway is not None:
+        return _record_from_remote(
+            gateway.save_dataset(
+                content,
+                file_name=ingestion.file_name,
+                file_type=ingestion.file_type,
+                size_bytes=ingestion.size_bytes,
+                row_count=int(ingestion.dataframe.shape[0]),
+                column_count=int(ingestion.dataframe.shape[1]),
+                available_sheets=list(ingestion.available_sheets),
+                selected_sheets=list(ingestion.selected_sheets),
+                active_sheet=ingestion.active_sheet,
+                combined=bool(ingestion.combined),
+                context=context or {},
+            )
+        )
     resolved_db_path = init_dataset_store(db_path, storage_dir)
+    assert resolved_db_path is not None
     resolved_storage_dir = Path(storage_dir) if storage_dir is not None else default_storage_dir()
     resolved_storage_dir.mkdir(parents=True, exist_ok=True)
 
@@ -186,7 +248,11 @@ def list_stored_datasets(
     db_path: str | Path | None = None,
     storage_dir: str | Path | None = None,
 ) -> list[StoredDatasetRecord]:
+    gateway = _remote_gateway()
+    if gateway is not None:
+        return [_record_from_remote(row) for row in gateway.list_datasets()]
     resolved_db_path = init_dataset_store(db_path, storage_dir)
+    assert resolved_db_path is not None
     with sqlite3.connect(resolved_db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -200,7 +266,12 @@ def get_stored_dataset(
     db_path: str | Path | None = None,
     storage_dir: str | Path | None = None,
 ) -> StoredDatasetRecord | None:
+    gateway = _remote_gateway()
+    if gateway is not None:
+        payload = gateway.get_dataset(dataset_id)
+        return _record_from_remote(payload) if payload else None
     resolved_db_path = init_dataset_store(db_path, storage_dir)
+    assert resolved_db_path is not None
     with sqlite3.connect(resolved_db_path) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -215,7 +286,24 @@ def load_stored_dataset(
     db_path: str | Path | None = None,
     storage_dir: str | Path | None = None,
 ) -> tuple[IngestionResult, StoredDatasetRecord]:
+    gateway = _remote_gateway()
+    if gateway is not None:
+        payload = gateway.get_dataset(dataset_id)
+        if payload is None:
+            raise ValueError("Saved dataset was not found.")
+        record = _record_from_remote(payload)
+        result = load_dataset(
+            gateway.download_dataset(payload),
+            filename=record.file_name,
+            selected_sheets=record.selected_sheets,
+            combine_sheets=record.combined,
+        )
+        if record.active_sheet in result.dataframes:
+            result.active_sheet = record.active_sheet
+        gateway.mark_dataset_loaded(dataset_id)
+        return result, record
     resolved_db_path = init_dataset_store(db_path, storage_dir)
+    assert resolved_db_path is not None
     record = get_stored_dataset(dataset_id, resolved_db_path, storage_dir)
     if record is None:
         raise ValueError("Saved dataset was not found.")
@@ -246,7 +334,15 @@ def delete_stored_dataset(
     db_path: str | Path | None = None,
     storage_dir: str | Path | None = None,
 ) -> bool:
+    gateway = _remote_gateway()
+    if gateway is not None:
+        payload = gateway.get_dataset(dataset_id)
+        if payload is None:
+            return False
+        gateway.delete_dataset(payload)
+        return True
     resolved_db_path = init_dataset_store(db_path, storage_dir)
+    assert resolved_db_path is not None
     record = get_stored_dataset(dataset_id, resolved_db_path, storage_dir)
     if record is None:
         return False

@@ -12,7 +12,8 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from components.ui import STEP_LABELS, app_header, inject_global_styles, metric_card, step_indicator, upload_showcase
+from components.analytics_dashboard import render_professional_analytics_dashboard
+from components.ui import STEP_LABELS, app_header, inject_global_styles, metric_card, render_sidebar_brand, step_indicator, upload_showcase
 from core.cleaning import apply_cleaning_pipeline, cleaning_log_to_dataframe, recommend_cleaning_actions
 from core.dataset_store import (
     StoredDatasetRecord,
@@ -35,10 +36,21 @@ from core.history import init_history_db, record_analysis_run
 from core.ingestion import IngestionResult, load_dataset, list_excel_sheets
 from core.insights import generate_insights
 from core.profiler import assess_data_quality, profile_dataframe
+from core.production import (
+    ProductionConfigurationError,
+    UserIdentity,
+    active_gateway,
+    configure_request_context,
+    production_enabled,
+    production_settings,
+    set_active_workspace,
+)
+from core.reference_data import evaluate_configured_reference_checks
 from core.reporting import build_html_report, generate_pdf_report
 from core.security import mask_sensitive_preview, validate_upload
 from core.statistics import analyze_dataframe
 from core.validation import evaluate_validation_rules
+from core.validation_templates import available_templates, build_template_rules
 from models.schemas import BusinessContext, ValidationRule
 
 
@@ -64,7 +76,6 @@ def init_state() -> None:
     defaults = {
         "step": 0,
         "theme_mode": "Light",
-        "font_style": "Inter",
         "context": BusinessContext().model_dump(),
         "ingestion": None,
         "active_dataset_key": None,
@@ -85,9 +96,95 @@ def init_state() -> None:
         "active_storage_record_id": None,
         "storage_notice": None,
         "pending_delete_dataset_id": None,
+        "data_updated_at": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+
+
+def _user_claim(name: str) -> str | None:
+    """Read a verified OIDC claim without relying on a provider-specific shape."""
+
+    try:
+        value = getattr(st.user, name, None)
+        if value is None:
+            value = st.user.get(name)  # type: ignore[attr-defined]
+    except (AttributeError, KeyError):
+        return None
+    return str(value) if value else None
+
+
+def configure_production_access() -> None:
+    """Require a real OIDC identity before the Supabase backend can be used."""
+
+    configure_request_context(None)
+    if not production_enabled():
+        return
+
+    try:
+        production_settings().validate()
+    except ProductionConfigurationError as exc:
+        st.error(str(exc), icon=":material/error:")
+        st.stop()
+
+    if not st.user.is_logged_in:
+        st.title("Sign in to InsightForge")
+        st.write("Production workspaces require a verified account before data can be stored.")
+        if st.button("Sign in", type="primary", icon=":material/login:"):
+            st.login()
+        st.stop()
+
+    user_id = _user_claim("sub")
+    if not user_id:
+        st.error("The identity provider did not return a stable user ID (sub claim).", icon=":material/error:")
+        st.stop()
+    configure_request_context(
+        UserIdentity(
+            user_id=user_id,
+            email=_user_claim("email"),
+            display_name=_user_claim("name") or _user_claim("preferred_username"),
+        ),
+        st.session_state.get("active_workspace_id"),
+    )
+
+
+def render_workspace_selector() -> None:
+    """Let production users switch only between workspaces they can access."""
+
+    if not production_enabled():
+        return
+    try:
+        gateway = active_gateway()
+        assert gateway is not None
+        workspaces = gateway.list_workspaces()
+        if not workspaces:
+            gateway.ensure_personal_workspace()
+            workspaces = gateway.list_workspaces()
+        if not workspaces:
+            raise ProductionConfigurationError("No workspace could be created for this account.")
+
+        by_id = {str(item["id"]): item for item in workspaces}
+        current = st.session_state.get("active_workspace_id")
+        if current not in by_id:
+            current = str(workspaces[0]["id"])
+        selected = st.selectbox(
+            "Workspace",
+            options=list(by_id),
+            index=list(by_id).index(current),
+            format_func=lambda workspace_id: f"{by_id[workspace_id].get('name', 'Workspace')} · {by_id[workspace_id].get('role', 'viewer')}",
+            key="workspace_selector",
+        )
+        gateway.select_workspace(selected)
+        st.session_state.active_workspace_id = selected
+        set_active_workspace(selected)
+        st.badge("Private Supabase workspace", icon=":material/cloud_done:", color="green")
+    except Exception as exc:
+        st.error(f"Workspace access is unavailable: {exc}", icon=":material/error:")
+        st.stop()
+
+
+def storage_backend_label() -> str:
+    return "Private cloud workspace" if production_enabled() else "Permanent local storage"
 
 
 def _new_workspace(frame: pd.DataFrame) -> dict[str, Any]:
@@ -104,6 +201,7 @@ def _new_workspace(frame: pd.DataFrame) -> dict[str, Any]:
         "charts": [],
         "insights": None,
         "run_recorded": False,
+        "data_updated_at": datetime.now().isoformat(),
     }
 
 
@@ -124,12 +222,13 @@ def _save_active_workspace() -> None:
         "charts",
         "insights",
         "run_recorded",
+        "data_updated_at",
     ]:
         workspaces[active_key][key] = st.session_state.get(key)
 
 
 def _clear_dataset_widget_state() -> None:
-    prefixes = ("enabled_", "action_", "custom_")
+    prefixes = ("enabled_", "action_", "custom_", "analytics_")
     exact_keys = {"active_dataset_selector", "duplicate_key_columns"}
     for key in list(st.session_state.keys()):
         if key in exact_keys or any(str(key).startswith(prefix) for prefix in prefixes):
@@ -152,6 +251,12 @@ def load_ingestion_into_session(
     if context:
         st.session_state.context = BusinessContext(**context).model_dump()
     activate_dataset(result.active_sheet)
+
+
+def mark_dataset_updated() -> None:
+    """Keep a stable, user-visible update time for the active processed dataset."""
+
+    st.session_state.data_updated_at = datetime.now().isoformat()
 
 
 def activate_dataset(dataset_key: str) -> None:
@@ -214,9 +319,13 @@ def render_storage_sidebar() -> list[StoredDatasetRecord]:
         st.success(notice, icon=":material/check_circle:")
         st.session_state.storage_notice = None
 
-    st.badge("Permanent local storage", icon=":material/database:", color="green")
+    st.badge(storage_backend_label(), icon=":material/database:", color="green")
     if not records:
-        st.caption("Saved uploads will appear here after you load a dataset.")
+        st.caption(
+            "Saved uploads are private to your selected workspace."
+            if production_enabled()
+            else "Saved uploads will appear here after you load a dataset."
+        )
         return records
 
     record_ids = [record.id for record in records]
@@ -251,7 +360,12 @@ def render_storage_sidebar() -> list[StoredDatasetRecord]:
         st.session_state.pending_delete_dataset_id = selected_id
 
     if st.session_state.get("pending_delete_dataset_id") == selected_id:
-        st.warning("This removes the saved local copy from the dataset library.", icon=":material/warning:")
+        st.warning(
+            "This permanently removes the selected dataset from this workspace."
+            if production_enabled()
+            else "This removes the saved local copy from the dataset library.",
+            icon=":material/warning:",
+        )
         confirm_col, cancel_col = st.columns(2)
         if confirm_col.button("Confirm", icon=":material/check:", key="confirm_delete_saved_dataset", width="stretch"):
             try:
@@ -339,10 +453,10 @@ def _humanize_label(value: str) -> str:
 def render_dataset_details(ingestion: IngestionResult) -> None:
     with st.expander("Dataset details", expanded=False, icon=":material/folder_open:"):
         storage_status = (
-            "Saved in local dataset library"
-            if st.session_state.get("active_storage_record_id")
-            else "Current browser session only"
-        )
+            "Saved in private cloud workspace"
+            if production_enabled()
+            else "Saved in local dataset library"
+        ) if st.session_state.get("active_storage_record_id") else "Current browser session only"
         st.table(
             {
                 ":material/description: File": ingestion.file_name,
@@ -397,10 +511,14 @@ def render_upload_step() -> None:
         accept_multiple_files=False,
     )
     save_upload = st.toggle(
-        "Save uploaded dataset to local library",
+        "Save uploaded dataset to private workspace" if production_enabled() else "Save uploaded dataset to local library",
         value=True,
         key="save_upload_permanently",
-        help="Stores a local copy under data/datasets so it can be loaded again after the app restarts.",
+        help=(
+            "Stores an encrypted-at-rest object in the selected Supabase workspace."
+            if production_enabled()
+            else "Stores a local copy under data/datasets so it can be loaded again after the app restarts."
+        ),
     )
 
     selected_sheets: list[str] | None = None
@@ -506,8 +624,10 @@ def render_profile_step() -> None:
         profile = cached_profile(df)
         quality = cached_quality(df, st.session_state.context)
         rule_issues = evaluate_validation_rules(df, [ValidationRule(**rule) for rule in st.session_state.validation_rules])
-        if rule_issues:
-            quality = {**quality, "issues": quality["issues"] + rule_issues}
+        reference_issues = evaluate_configured_reference_checks(df)
+        additional_issues = rule_issues + reference_issues
+        if additional_issues:
+            quality = {**quality, "issues": quality["issues"] + additional_issues}
         st.session_state.profile = profile
         st.session_state.quality = quality
 
@@ -557,6 +677,35 @@ def render_validation_rule_builder(df: pd.DataFrame) -> None:
     with st.expander("Custom validation rules", expanded=False):
         if st.session_state.validation_rules:
             st.dataframe(pd.DataFrame(st.session_state.validation_rules), width="stretch")
+
+        templates = available_templates(context_model().industry)
+        template_by_key = {template.key: template for template in templates}
+        selected_template = st.selectbox(
+            "Validation policy template",
+            options=list(template_by_key),
+            format_func=lambda key: template_by_key[key].label,
+            key="validation_policy_template",
+        )
+        st.caption(template_by_key[selected_template].description)
+        if st.button("Add template rules", icon=":material/library_add:", key="add_validation_template", width="stretch"):
+            suggested_rules = build_template_rules(selected_template, [str(column) for column in df.columns])
+            existing = {
+                (rule.get("column"), rule.get("rule_type"), json.dumps(rule.get("value"), sort_keys=True, default=str), json.dumps(rule.get("second_value"), sort_keys=True, default=str))
+                for rule in st.session_state.validation_rules
+            }
+            additions = [
+                rule.model_dump()
+                for rule in suggested_rules
+                if (rule.column, rule.rule_type, json.dumps(rule.value, sort_keys=True, default=str), json.dumps(rule.second_value, sort_keys=True, default=str)) not in existing
+            ]
+            if additions:
+                st.session_state.validation_rules.extend(additions)
+                st.success(f"Added {len(additions)} policy rule{'s' if len(additions) != 1 else ''}.")
+                st.rerun()
+            st.info("No new template rules match this dataset's columns.")
+
+        st.divider()
+        st.caption("Or add a custom rule")
         rule_type = st.selectbox(
             "Rule type",
             [
@@ -723,6 +872,7 @@ def render_cleaning_step() -> None:
             st.session_state.analysis = None
             st.session_state.charts = []
             st.session_state.insights = None
+            mark_dataset_updated()
             _save_active_workspace()
             st.success(f"Applied {len(audit)} approved cleaning actions.")
             st.rerun()
@@ -734,6 +884,7 @@ def render_cleaning_step() -> None:
             st.session_state.audit_log = audit
             st.session_state.profile = cached_profile(cleaned)
             st.session_state.quality = cached_quality(cleaned, st.session_state.context)
+            mark_dataset_updated()
             _save_active_workspace()
             st.rerun()
         if c3.button("Reset all cleaning", disabled=not st.session_state.applied_actions, icon=":material/restart_alt:", width="stretch"):
@@ -745,6 +896,7 @@ def render_cleaning_step() -> None:
             st.session_state.analysis = None
             st.session_state.charts = []
             st.session_state.insights = None
+            mark_dataset_updated()
             _save_active_workspace()
             st.rerun()
 
@@ -776,6 +928,7 @@ def render_cleaning_step() -> None:
             st.session_state.cleaned_df = cleaned
             st.session_state.applied_actions = actions
             st.session_state.audit_log = audit
+            mark_dataset_updated()
             _save_active_workspace()
             st.success("Saved cleaning configuration applied.")
             st.rerun()
@@ -844,16 +997,28 @@ def render_analysis_step() -> None:
 
     if not st.session_state.run_recorded:
         try:
-            db_path = init_history_db()
-            record_analysis_run(
-                db_path,
-                context_model().company_or_project,
-                st.session_state.file_name or "uploaded_data",
-                int(st.session_state.profile.get("row_count", len(df))),
-                int(st.session_state.profile.get("column_count", len(df.columns))),
-                float(st.session_state.quality.get("scores", {}).get("overall", 0)),
-                {"provider": st.session_state.insights.get("provider") if st.session_state.insights else None},
-            )
+            metadata = {"provider": st.session_state.insights.get("provider") if st.session_state.insights else None}
+            gateway = active_gateway()
+            if gateway is not None:
+                gateway.record_analysis_run(
+                    project_name=context_model().company_or_project,
+                    file_name=st.session_state.file_name or "uploaded_data",
+                    row_count=int(st.session_state.profile.get("row_count", len(df))),
+                    column_count=int(st.session_state.profile.get("column_count", len(df.columns))),
+                    quality_score=float(st.session_state.quality.get("scores", {}).get("overall", 0)),
+                    metadata=metadata,
+                )
+            else:
+                db_path = init_history_db()
+                record_analysis_run(
+                    db_path,
+                    context_model().company_or_project,
+                    st.session_state.file_name or "uploaded_data",
+                    int(st.session_state.profile.get("row_count", len(df))),
+                    int(st.session_state.profile.get("column_count", len(df.columns))),
+                    float(st.session_state.quality.get("scores", {}).get("overall", 0)),
+                    metadata,
+                )
             st.session_state.run_recorded = True
             _save_active_workspace()
         except Exception:
@@ -1013,24 +1178,40 @@ def render_download_step() -> None:
     navigation_controls(back_enabled=True, next_enabled=False)
 
 
+def render_analytics_dashboard_step() -> None:
+    df = st.session_state.cleaned_df
+    if df is None:
+        st.info("Upload a dataset first to generate an analytics dashboard.", icon=":material/upload_file:")
+        navigation_controls(back_enabled=True, next_enabled=False)
+        return
+
+    analysis = st.session_state.analysis or cached_analysis(df, st.session_state.context)
+    profile = st.session_state.profile or cached_profile(df)
+    updated_at = st.session_state.get("data_updated_at")
+    try:
+        last_updated = datetime.fromisoformat(updated_at) if updated_at else None
+    except (TypeError, ValueError):
+        last_updated = None
+    render_professional_analytics_dashboard(
+        df,
+        file_name=st.session_state.file_name,
+        analysis=analysis,
+        profile=profile,
+        context=context_model(),
+        last_updated=last_updated,
+    )
+    navigation_controls(back_enabled=True, next_enabled=False)
+
+
 def main() -> None:
     st.set_page_config(page_title="InsightForge AI", page_icon=":material/analytics:", layout="wide")
     init_state()
+    configure_production_access()
 
     with st.sidebar:
-        font_options = ["Inter", "Poppins"]
-        current_font = st.session_state.get("font_style", "Inter")
-        if current_font not in font_options:
-            current_font = "Inter"
-        font_style = st.radio(
-            "Theme",
-            font_options,
-            index=font_options.index(current_font),
-            key="font_style_selector",
-        )
-        if font_style:
-            st.session_state.font_style = font_style
+        render_sidebar_brand()
         st.session_state.theme_mode = "Light"
+        render_workspace_selector()
         storage_records = render_storage_sidebar()
         selected_step = st.radio("Workflow", list(range(len(STEP_LABELS))), format_func=lambda i: STEP_LABELS[i], index=st.session_state.step)
         if selected_step != st.session_state.step:
@@ -1038,9 +1219,13 @@ def main() -> None:
             st.rerun()
         render_loaded_dataset_selector()
         st.progress((st.session_state.step + 1) / len(STEP_LABELS))
-        st.caption("Saved datasets stay on this device.")
+        st.caption(
+            "Workspace data is protected by Supabase access controls."
+            if production_enabled()
+            else "Saved datasets stay on this device."
+        )
 
-    inject_global_styles(st.session_state.theme_mode, st.session_state.font_style)
+    inject_global_styles(st.session_state.theme_mode)
     dataset_label = f"{len(storage_records)} saved dataset{'s' if len(storage_records) != 1 else ''}"
     app_header(context_model().company_or_project, storage_label=dataset_label)
     step_indicator(st.session_state.step)
@@ -1058,6 +1243,8 @@ def main() -> None:
         render_dashboard_step()
     elif step == 5:
         render_download_step()
+    elif step == 6:
+        render_analytics_dashboard_step()
 
 
 if __name__ == "__main__":
