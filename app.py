@@ -14,7 +14,6 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from components.analytics_dashboard import render_professional_analytics_dashboard
 from components.ui import STEP_LABELS, app_header, inject_global_styles, metric_card, render_sidebar_brand, step_indicator, upload_showcase
 from core.analytics_dashboard import (
     AGGREGATIONS,
@@ -1736,31 +1735,6 @@ def render_download_step() -> None:
     navigation_controls(back_enabled=True, next_enabled=False)
 
 
-def render_analytics_dashboard_step() -> None:
-    df = st.session_state.cleaned_df
-    if df is None:
-        st.info("Upload a dataset first to generate an analytics dashboard.", icon=":material/upload_file:")
-        navigation_controls(back_enabled=True, next_enabled=False)
-        return
-
-    analysis = st.session_state.analysis or cached_analysis(df, st.session_state.context)
-    profile = st.session_state.profile or cached_profile(df)
-    updated_at = st.session_state.get("data_updated_at")
-    try:
-        last_updated = datetime.fromisoformat(updated_at) if updated_at else None
-    except (TypeError, ValueError):
-        last_updated = None
-    render_professional_analytics_dashboard(
-        df,
-        file_name=st.session_state.file_name,
-        analysis=analysis,
-        profile=profile,
-        context=context_model(),
-        last_updated=last_updated,
-    )
-    navigation_controls(back_enabled=True, next_enabled=False)
-
-
 def main() -> None:
     st.set_page_config(page_title="InsightForge AI", page_icon=":material/analytics:", layout="wide")
     init_state()
@@ -1801,8 +1775,6 @@ def main() -> None:
         render_dashboard_step()
     elif step == 5:
         render_download_step()
-    elif step == 6:
-        render_analytics_dashboard_step()
 
 
 if __name__ == "__main__":

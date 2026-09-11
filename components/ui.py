@@ -38,11 +38,6 @@ STEP_META = [
         "Download Files",
         "Download reports, cleaned data, and audit logs.",
     ),
-    (
-        "analytics",
-        "Analytics Dashboard",
-        "Review interactive KPIs, trends, quality, and detailed data.",
-    ),
 ]
 
 STEP_LABELS = [step[1] for step in STEP_META]
