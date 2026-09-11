@@ -11,7 +11,8 @@ InsightForge AI is a Streamlit MVP for turning messy business datasets into clea
 - Review cleaning recommendations before any change is applied.
 - Apply a reversible cleaning pipeline with an audit log, undo/reset controls, saved cleaning configurations, and key-column duplicate handling.
 - Calculate descriptive statistics, correlations, group comparisons, time summaries, Pareto analysis, anomalies, missing-data patterns, and selected inferential tests.
-- Generate interactive Plotly dashboards with business-context-aware charts and filters.
+- Explore a premium analytical dashboard with dataset-aware KPIs, date/category/search filters, trend analysis, segment comparisons, data downloads, and computed executive insights.
+- Optionally embed a real authorized Power BI report with server-side token generation. When Power BI is not configured, the app uses the native local Streamlit dashboard and clearly labels it as such.
 - Produce deterministic business insights without an AI key, with optional API-backed insight generation.
 - Download cleaned data, Excel analysis workbook, PDF report, HTML report, quality report, chart images, audit log, and cleaning configuration.
 
@@ -45,8 +46,10 @@ Screenshots can be added after running the app locally with `sample_data/messy_s
 |   |-- cleaning.py
 |   |-- validation.py
 |   |-- statistics.py
+|   |-- analytics_dashboard.py
 |   |-- visualization.py
 |   |-- insights.py
+|   |-- powerbi.py
 |   |-- reporting.py
 |   |-- exporting.py
 |   |-- history.py
@@ -61,6 +64,19 @@ Screenshots can be added after running the app locally with `sample_data/messy_s
 ```
 
 The Streamlit interface in `app.py` is intentionally thin. Most business logic lives in `core/`, so a future FastAPI backend and React/Next.js frontend can reuse the ingestion, profiling, cleaning, analysis, insight, and export engines.
+
+## Analytical Dashboard
+
+The **Analytical Dashboard** is generated from the active uploaded or saved dataset. It infers safe date, measure, and dimension candidates from the cleaned dataframe, excludes identifier-like numeric columns from default sums, and lets the user override the selected fields.
+
+- **Header:** shows the active dataset name, row count, column count, and last processed timestamp.
+- **Filter toolbar:** supports date range filtering, primary measure/aggregation selection, primary segment selection, searchable row filtering, categorical filters, active filter indicators, and reset.
+- **KPI cards:** show filtered record count, selected metric, completeness, top segment, date coverage, or duplicate count depending on the available data.
+- **Charts:** show trend, category comparison, distribution, relationship checks, and missingness only when the dataset supports them.
+- **Insights:** separates factual observations, suggested next actions, and reliability notes. It does not infer causation from correlation.
+- **Data table and export:** previews the filtered dataset with sensitive masking and provides a filtered CSV download.
+
+KPI formulas are displayed in the UI. Count-based metrics use filtered record counts; numeric metrics aggregate only valid numeric values and report excluded missing or invalid values.
 
 ## Local Installation
 
@@ -106,6 +122,20 @@ Optional AI mode:
 
 The AI layer sends only metadata, aggregate statistics, data-quality summaries, statistical-test summaries, trend summaries, anomaly summaries, and business context. It does not send the full dataset by default.
 
+Optional Power BI Embedded mode:
+
+- `POWERBI_TENANT_ID=...`
+- `POWERBI_CLIENT_ID=...`
+- `POWERBI_CLIENT_SECRET=...`
+- `POWERBI_WORKSPACE_ID=...`
+- `POWERBI_REPORT_ID=...`
+- `POWERBI_DATASET_ID=...`
+- `POWERBI_RLS_USERNAME=...`
+- `POWERBI_RLS_ROLES=...`
+- `POWERBI_TOKEN_LIFETIME_MINUTES=45`
+
+Power BI settings belong in Streamlit secrets or environment variables, never in browser-side code. The app generates embed tokens on the server and does not send uploaded local datasets to Power BI. Prepare or refresh the Power BI semantic model separately, and use workspace permissions plus row-level security when private data is involved. Do not use Power BI **Publish to web** for private uploaded datasets because it creates a public unauthenticated report link.
+
 ## Run The Application
 
 Windows PowerShell:
@@ -136,7 +166,7 @@ macOS and Linux:
 pytest
 ```
 
-The current test suite covers ingestion, profiling, quality checks, cleaning/audit behavior, statistics, deterministic insight fallback, exports, and Streamlit app initialization.
+The current test suite covers ingestion, profiling, quality checks, cleaning/audit behavior, statistics, deterministic insight fallback, exports, analytical dashboard logic, Power BI configuration helpers, and Streamlit app initialization.
 
 ## Production workspaces (Supabase)
 

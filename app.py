@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html
 import os
 import uuid
 from datetime import date, datetime
@@ -8,12 +9,27 @@ from io import BytesIO
 from numbers import Number
 from typing import Any
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
 from components.analytics_dashboard import render_professional_analytics_dashboard
 from components.ui import STEP_LABELS, app_header, inject_global_styles, metric_card, render_sidebar_brand, step_indicator, upload_showcase
+from core.analytics_dashboard import (
+    AGGREGATIONS,
+    COUNT_SENTINEL,
+    aggregation_label,
+    apply_dashboard_filters,
+    build_dashboard_insights,
+    build_dashboard_kpis,
+    category_data,
+    distribution_data,
+    infer_dashboard_roles,
+    missing_data,
+    scatter_data,
+    trend_data,
+)
 from core.cleaning import apply_cleaning_pipeline, cleaning_log_to_dataframe, recommend_cleaning_actions
 from core.dataset_store import (
     StoredDatasetRecord,
@@ -35,6 +51,15 @@ from core.exporting import (
 from core.history import init_history_db, record_analysis_run
 from core.ingestion import IngestionResult, load_dataset, list_excel_sheets
 from core.insights import generate_insights
+from core.powerbi import (
+    PowerBIConfigurationError,
+    PowerBIEmbedError,
+    build_powerbi_embed_html,
+    generate_powerbi_embed_payload,
+    load_powerbi_config,
+    powerbi_setup_checklist,
+    required_powerbi_settings,
+)
 from core.profiler import assess_data_quality, profile_dataframe
 from core.production import (
     ProductionConfigurationError,
@@ -89,6 +114,7 @@ def init_state() -> None:
         "audit_log": [],
         "validation_rules": [],
         "analysis": None,
+        "analysis_last_processed": None,
         "charts": [],
         "insights": None,
         "file_name": None,
@@ -198,6 +224,7 @@ def _new_workspace(frame: pd.DataFrame) -> dict[str, Any]:
         "applied_actions": [],
         "audit_log": [],
         "analysis": None,
+        "analysis_last_processed": None,
         "charts": [],
         "insights": None,
         "run_recorded": False,
@@ -219,6 +246,7 @@ def _save_active_workspace() -> None:
         "applied_actions",
         "audit_log",
         "analysis",
+        "analysis_last_processed",
         "charts",
         "insights",
         "run_recorded",
@@ -870,6 +898,7 @@ def render_cleaning_step() -> None:
             st.session_state.profile = cached_profile(cleaned)
             st.session_state.quality = cached_quality(cleaned, st.session_state.context)
             st.session_state.analysis = None
+            st.session_state.analysis_last_processed = None
             st.session_state.charts = []
             st.session_state.insights = None
             mark_dataset_updated()
@@ -884,6 +913,10 @@ def render_cleaning_step() -> None:
             st.session_state.audit_log = audit
             st.session_state.profile = cached_profile(cleaned)
             st.session_state.quality = cached_quality(cleaned, st.session_state.context)
+            st.session_state.analysis = None
+            st.session_state.analysis_last_processed = None
+            st.session_state.charts = []
+            st.session_state.insights = None
             mark_dataset_updated()
             _save_active_workspace()
             st.rerun()
@@ -894,6 +927,7 @@ def render_cleaning_step() -> None:
             st.session_state.profile = None
             st.session_state.quality = None
             st.session_state.analysis = None
+            st.session_state.analysis_last_processed = None
             st.session_state.charts = []
             st.session_state.insights = None
             mark_dataset_updated()
@@ -928,6 +962,10 @@ def render_cleaning_step() -> None:
             st.session_state.cleaned_df = cleaned
             st.session_state.applied_actions = actions
             st.session_state.audit_log = audit
+            st.session_state.analysis = None
+            st.session_state.analysis_last_processed = None
+            st.session_state.charts = []
+            st.session_state.insights = None
             mark_dataset_updated()
             _save_active_workspace()
             st.success("Saved cleaning configuration applied.")
@@ -956,6 +994,7 @@ def render_analysis_step() -> None:
             )
             insights = generate_insights(profile, quality, analysis, context_model())
             st.session_state.analysis = analysis
+            st.session_state.analysis_last_processed = datetime.now().isoformat(timespec="seconds")
             st.session_state.charts = charts
             st.session_state.insights = insights
             st.session_state.profile = profile
@@ -1027,85 +1066,604 @@ def render_analysis_step() -> None:
     navigation_controls(back_enabled=True, next_enabled=True)
 
 
-def _filtered_dashboard_frame(df: pd.DataFrame, analysis: dict[str, Any]) -> pd.DataFrame:
-    filtered = df.copy()
-    groups = analysis.get("column_groups", {})
-    date_cols = groups.get("date", [])
-    categorical = groups.get("categorical", [])
-    with st.sidebar:
-        st.markdown("### Dashboard filters")
-        if date_cols:
-            date_col = st.selectbox("Date field", date_cols)
-            dates = pd.to_datetime(filtered[date_col], errors="coerce")
-            if dates.notna().any():
-                min_date = dates.min().date()
-                max_date = dates.max().date()
-                selected = st.date_input("Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
-                if isinstance(selected, tuple) and len(selected) == 2:
-                    start, end = selected
-                    filtered = filtered[(dates.dt.date >= start) & (dates.dt.date <= end)]
-        for column in categorical[:3]:
-            values = filtered[column].dropna().astype(str).value_counts().head(30).index.tolist()
-            selected_values = st.multiselect(column, values, default=values)
-            if selected_values:
-                filtered = filtered[filtered[column].astype(str).isin(selected_values)]
-    return filtered
+def _dashboard_key(df: pd.DataFrame) -> str:
+    identity = {
+        "file_name": st.session_state.get("file_name"),
+        "active_dataset_key": st.session_state.get("active_dataset_key"),
+        "shape": df.shape,
+        "columns": [str(column) for column in df.columns],
+        "dtypes": [str(dtype) for dtype in df.dtypes],
+    }
+    return uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(identity, sort_keys=True)).hex[:10]
+
+
+def _set_widget_default(key: str, value: Any) -> None:
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def _selectbox_with_default(label: str, options: list[Any], default: Any, key: str, **kwargs: Any) -> Any:
+    if not options:
+        return None
+    default = default if default in options else options[0]
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = default
+    return st.selectbox(label, options, key=key, **kwargs)
+
+
+def _multiselect_with_default(label: str, options: list[str], key: str, **kwargs: Any) -> list[str]:
+    current = st.session_state.get(key, [])
+    current = [value for value in current if value in options] if isinstance(current, list) else []
+    if st.session_state.get(key) != current:
+        st.session_state[key] = current
+    return st.multiselect(label, options, key=key, **kwargs)
+
+
+def _reset_widget_keys(keys: tuple[str, ...]) -> None:
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
+def _format_metric_value(value: Any, value_format: str | None = None) -> str:
+    if value_format == "percent_100":
+        try:
+            return f"{float(value):.1f}%"
+        except (TypeError, ValueError):
+            return "n/a"
+    if isinstance(value, str):
+        return value[:42] + "..." if len(value) > 45 else value
+    if isinstance(value, Number):
+        number = float(value)
+        if abs(number) >= 1_000_000_000:
+            return f"{number / 1_000_000_000:,.2f}B"
+        if abs(number) >= 1_000_000:
+            return f"{number / 1_000_000:,.2f}M"
+        if abs(number) >= 10_000:
+            return f"{number / 1_000:,.1f}K"
+        return format_display_value(number)
+    return format_display_value(value)
+
+
+def _format_last_processed(value: str | None) -> str:
+    if not value:
+        return "Not processed in this session"
+    try:
+        return datetime.fromisoformat(value).strftime("%b %d, %Y %I:%M %p")
+    except ValueError:
+        return value
+
+
+def _render_analytics_styles() -> None:
+    st.html(
+        """
+        <style>
+        :root {
+            --if-dash-bg: #F7F8FA;
+            --if-dash-card: #FFFFFF;
+            --if-dash-border: #E5E7EB;
+            --if-dash-text: #111827;
+            --if-dash-muted: #6B7280;
+            --if-dash-accent: #4F46E5;
+        }
+        .if-analytics-header {
+            border: 1px solid var(--if-dash-border);
+            border-radius: 12px;
+            background: var(--if-dash-card);
+            padding: 18px 20px;
+            margin-bottom: 14px;
+            box-shadow: 0 10px 24px rgba(17, 24, 39, 0.05);
+        }
+        .if-analytics-eyebrow {
+            color: var(--if-dash-muted);
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+        .if-analytics-title {
+            color: var(--if-dash-text);
+            font-size: 24px;
+            line-height: 1.2;
+            font-weight: 760;
+            margin-bottom: 6px;
+        }
+        .if-analytics-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            color: var(--if-dash-muted);
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .if-analytics-chip {
+            border: 1px solid var(--if-dash-border);
+            border-radius: 999px;
+            padding: 5px 9px;
+            background: #F9FAFB;
+        }
+        .if-analytics-section-label {
+            color: var(--if-dash-muted);
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+        .if-analytics-empty {
+            border: 1px dashed var(--if-dash-border);
+            border-radius: 12px;
+            background: #FFFFFF;
+            color: var(--if-dash-muted);
+            padding: 18px;
+        }
+        </style>
+        """
+    )
+
+
+def _render_dashboard_header(dataset_name: str, rows: int, columns: int) -> None:
+    last_processed = _format_last_processed(st.session_state.get("analysis_last_processed"))
+    safe_dataset = html.escape(dataset_name)
+    safe_processed = html.escape(last_processed)
+    st.html(
+        f"""
+        <div class="if-analytics-header">
+            <div class="if-analytics-eyebrow">Native local analytics dashboard</div>
+            <div class="if-analytics-title">Analytical Dashboard</div>
+            <div class="if-analytics-meta">
+                <span class="if-analytics-chip">{safe_dataset}</span>
+                <span class="if-analytics-chip">{rows:,} rows</span>
+                <span class="if-analytics-chip">{columns:,} columns</span>
+                <span class="if-analytics-chip">Last processed: {safe_processed}</span>
+            </div>
+        </div>
+        """
+    )
+
+
+def _render_kpi_cards(kpis: list[dict[str, Any]]) -> None:
+    columns = st.columns(min(max(len(kpis), 1), 5))
+    for column, kpi in zip(columns, kpis):
+        with column:
+            with st.container(border=True):
+                st.metric(
+                    kpi["label"],
+                    _format_metric_value(kpi.get("value"), kpi.get("format")),
+                    delta=kpi.get("delta"),
+                    border=False,
+                )
+                st.caption(kpi.get("definition", "Computed from the filtered records."))
+
+
+def _base_chart(chart: alt.Chart, height: int = 320) -> alt.Chart:
+    return (
+        chart.properties(height=height)
+        .configure_axis(labelColor="#6B7280", titleColor="#6B7280", gridColor="#EEF2F7")
+        .configure_view(strokeWidth=0)
+    )
+
+
+def _render_trend_chart(frame: pd.DataFrame, metric_label: str) -> None:
+    chart = (
+        alt.Chart(frame)
+        .mark_line(point=True, color="#4F46E5", strokeWidth=2.5)
+        .encode(
+            x=alt.X("period:T", title="Period"),
+            y=alt.Y("value:Q", title=metric_label),
+            tooltip=[alt.Tooltip("period:T", title="Period"), alt.Tooltip("value:Q", title=metric_label, format=",.2f")],
+        )
+    )
+    st.altair_chart(_base_chart(chart, 330), width="stretch")
+
+
+def _render_category_chart(frame: pd.DataFrame, dimension: str, metric_label: str) -> None:
+    chart = (
+        alt.Chart(frame)
+        .mark_bar(color="#4F46E5", cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+        .encode(
+            y=alt.Y("category:N", sort="-x", title=dimension),
+            x=alt.X("value:Q", title=metric_label),
+            tooltip=[alt.Tooltip("category:N", title=dimension), alt.Tooltip("value:Q", title=metric_label, format=",.2f")],
+        )
+    )
+    st.altair_chart(_base_chart(chart, 330), width="stretch")
+
+
+def _render_distribution_chart(frame: pd.DataFrame, measure: str, sampled: bool) -> None:
+    chart = (
+        alt.Chart(frame)
+        .mark_bar(color="#4F46E5", opacity=0.82)
+        .encode(
+            x=alt.X(f"{measure}:Q", bin=alt.Bin(maxbins=30), title=measure),
+            y=alt.Y("count():Q", title="Records"),
+            tooltip=[alt.Tooltip("count():Q", title="Records")],
+        )
+    )
+    st.altair_chart(_base_chart(chart, 260), width="stretch")
+    if sampled:
+        st.caption("Distribution rendered from a deterministic sample for responsiveness.")
+
+
+def _render_scatter_chart(frame: pd.DataFrame, x_col: str, y_col: str, sampled: bool) -> None:
+    chart = (
+        alt.Chart(frame)
+        .mark_circle(color="#4F46E5", opacity=0.58, size=46)
+        .encode(
+            x=alt.X(f"{x_col}:Q", title=x_col),
+            y=alt.Y(f"{y_col}:Q", title=y_col),
+            tooltip=[alt.Tooltip(f"{x_col}:Q", format=",.2f"), alt.Tooltip(f"{y_col}:Q", format=",.2f")],
+        )
+    )
+    st.altair_chart(_base_chart(chart, 260), width="stretch")
+    st.caption("Scatter plots show association only, not causation.")
+    if sampled:
+        st.caption("Scatter rendered from a deterministic sample for responsiveness.")
+
+
+def _render_missing_chart(frame: pd.DataFrame) -> None:
+    chart = (
+        alt.Chart(frame)
+        .mark_bar(color="#DC2626", cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+        .encode(
+            y=alt.Y("column:N", sort="-x", title="Column"),
+            x=alt.X("missing_count:Q", title="Missing values"),
+            tooltip=[
+                alt.Tooltip("column:N", title="Column"),
+                alt.Tooltip("missing_count:Q", title="Missing values"),
+                alt.Tooltip("missing_pct:Q", title="Missing %", format=".1f"),
+            ],
+        )
+    )
+    st.altair_chart(_base_chart(chart, 260), width="stretch")
+
+
+def _streamlit_secrets_mapping() -> dict[str, Any]:
+    try:
+        return dict(st.secrets)
+    except Exception:
+        return {}
+
+
+def _render_powerbi_panel(dataset_name: str, roles: dict[str, Any], dash_key: str) -> None:
+    with st.container(border=True):
+        st.markdown("**Power BI report integration**")
+        st.caption(
+            "This panel is separate from the native local dashboard above. It embeds an actual Power BI report only when workspace, report, tenant, and service-principal settings are configured."
+        )
+        config = load_powerbi_config(_streamlit_secrets_mapping())
+
+        if not config.is_configured:
+            st.warning(
+                "Power BI is not configured yet. The working dashboard above is native Streamlit analytics based on the uploaded or cleaned dataset.",
+                icon=":material/info:",
+            )
+            st.dataframe(pd.DataFrame(required_powerbi_settings()), width="stretch", hide_index=True)
+            with st.expander("Power BI setup checklist", icon=":material/checklist:"):
+                for item in powerbi_setup_checklist():
+                    st.write(f"- {item}")
+                st.caption(
+                    "Uploaded files are not sent to Power BI by this app. To use Power BI, publish or refresh a semantic model separately, map fields intentionally, and enforce workspace isolation or RLS where needed."
+                )
+            return
+
+        st.success("Power BI configuration detected.", icon=":material/verified:")
+        st.table(config.public_summary())
+        if not config.rls_username or not config.rls_roles:
+            st.warning(
+                "No RLS effective identity is configured. Confirm the report is safe for the configured workspace audience before loading it.",
+                icon=":material/security:",
+            )
+        st.caption(
+            f"Native dataset in view: {dataset_name}. Power BI report data comes from the configured semantic model, not automatically from this uploaded file."
+        )
+
+        load_key = f"powerbi_load_{dash_key}"
+        if st.button("Load authorized Power BI report", key=f"powerbi_button_{dash_key}", icon=":material/open_in_new:", width="stretch"):
+            st.session_state[load_key] = True
+
+        if st.session_state.get(load_key):
+            try:
+                with st.spinner("Generating server-side Power BI embed token..."):
+                    payload = generate_powerbi_embed_payload(config)
+                st.caption(
+                    f"Actual Power BI report: {payload.report_name}. Embed token expires: {payload.expiration or 'not returned by API'}."
+                )
+                st.iframe(build_powerbi_embed_html(payload), height=760)
+            except PowerBIConfigurationError as exc:
+                st.error(str(exc), icon=":material/error:")
+                st.session_state[load_key] = False
+            except PowerBIEmbedError as exc:
+                st.error(f"Power BI embed failed: {exc}", icon=":material/error:")
+                st.session_state[load_key] = False
 
 
 def render_dashboard_step() -> None:
-    st.subheader("Explore Dashboard", icon=":material/dashboard:")
+    _render_analytics_styles()
     df = st.session_state.cleaned_df
-    analysis = st.session_state.analysis
-    if df is None or analysis is None:
-        st.info("Run the analysis first.")
+    if df is None:
+        st.info("Upload and clean a dataset first.")
         navigation_controls(back_enabled=True, next_enabled=False)
         return
 
-    filtered = _filtered_dashboard_frame(analysis["prepared_df"], analysis)
-    profile = cached_profile(filtered)
-    quality = cached_quality(filtered, st.session_state.context)
-    filtered_analysis = cached_analysis(filtered, st.session_state.context)
-    from core.visualization import build_dashboard_figures
+    if st.session_state.analysis is None:
+        with st.spinner("Preparing analytical dashboard..."):
+            st.session_state.analysis = cached_analysis(df, st.session_state.context)
+            st.session_state.analysis_last_processed = datetime.now().isoformat(timespec="seconds")
+            st.session_state.profile = st.session_state.profile or cached_profile(df)
+            st.session_state.quality = st.session_state.quality or cached_quality(df, st.session_state.context)
+            _save_active_workspace()
 
-    charts = build_dashboard_figures(filtered_analysis["prepared_df"], profile, quality, filtered_analysis, context_model())
+    analysis = st.session_state.analysis
+    prepared_df = analysis.get("prepared_df", df)
+    profile = st.session_state.profile or cached_profile(df)
+    roles = infer_dashboard_roles(prepared_df, context_model(), profile)
+    dash_key = _dashboard_key(prepared_df)
+    dataset_name = st.session_state.file_name or st.session_state.active_dataset_key or "Current dataset"
 
-    score = quality.get("scores", {}).get("overall", "n/a")
-    kpis = filtered_analysis.get("kpis", {})
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        metric_card("Quality score", f"{score}/100", "Heuristic data-quality index")
-    with c2:
-        metric_card("Rows in view", f"{len(filtered):,}", "After dashboard filters")
-    with c3:
-        metric_card("Missing cells", f"{kpis.get('missing_cells', 0):,}", "Current view")
-    with c4:
-        metric_card("Duplicate rows", f"{kpis.get('duplicate_rows', 0):,}", "Current view")
+    _render_dashboard_header(dataset_name, len(prepared_df), len(prepared_df.columns))
 
-    insights = st.session_state.insights or generate_insights(profile, quality, filtered_analysis, context_model())
-    with st.expander("Executive summary", expanded=True):
-        for item in insights.get("sections", {}).get("Executive Summary", []):
-            st.write(item)
+    if prepared_df.empty:
+        st.html('<div class="if-analytics-empty">This dataset has no rows after cleaning. Load a non-empty dataset to build KPIs, charts, and insights.</div>')
+        navigation_controls(back_enabled=True, next_enabled=True)
+        return
 
-    if charts:
-        for index in range(0, len(charts), 2):
-            left, right = st.columns(2)
-            for column, chart in zip([left, right], charts[index : index + 2]):
-                with column:
-                    st.plotly_chart(chart["figure"], width="stretch")
-                    st.caption(
-                        f"{chart['interpretation']} "
-                        f"Source columns: {', '.join(chart['source_columns'])}. "
-                        f"{'Rendered from a sample for responsiveness.' if chart.get('sampled') else ''}"
+    for warning in roles.get("warnings", []):
+        st.caption(f":material/info: {warning}")
+
+    measure_options = [COUNT_SENTINEL] + roles["measure_candidates"]
+    technical_key = f"analytics_show_technical_{dash_key}"
+    show_technical = st.toggle(
+        "Show technical numeric fields",
+        value=False,
+        key=technical_key,
+        help="Reveals identifier-like numeric columns. They are hidden by default so IDs and codes are not summed accidentally.",
+    )
+    if show_technical:
+        measure_options += [column for column in roles["technical_numeric_candidates"] if column not in measure_options]
+
+    default_measure = roles["default_measure"] or COUNT_SENTINEL
+    date_options = ["No date field"] + roles["date_candidates"]
+    dimension_options = ["No segment"] + roles["dimension_candidates"]
+
+    widget_keys: list[str] = []
+    with st.container(border=True):
+        st.markdown("**Filters and field mapping**")
+        role_cols = st.columns([1.25, 1.25, 1.25, 1.25])
+        with role_cols[0]:
+            selected_date = _selectbox_with_default(
+                "Date field",
+                date_options,
+                roles["default_date"] or "No date field",
+                f"analytics_date_{dash_key}",
+                help="Used only for time trends and optional date filtering.",
+            )
+            widget_keys.append(f"analytics_date_{dash_key}")
+        with role_cols[1]:
+            selected_measure = _selectbox_with_default(
+                "Measure",
+                measure_options,
+                default_measure,
+                f"analytics_measure_{dash_key}",
+                format_func=lambda value: "Count records" if value == COUNT_SENTINEL else str(value),
+                help="Identifier-like numeric columns are excluded unless you enable technical fields.",
+            )
+            widget_keys.append(f"analytics_measure_{dash_key}")
+        with role_cols[2]:
+            default_aggregation = "count" if selected_measure == COUNT_SENTINEL else roles["default_aggregation"]
+            _set_widget_default(f"analytics_aggregation_{dash_key}", default_aggregation)
+            aggregation = st.segmented_control(
+                "Aggregation",
+                AGGREGATIONS,
+                key=f"analytics_aggregation_{dash_key}",
+                format_func=lambda value: value.replace("_", " ").title(),
+                required=True,
+                disabled=selected_measure == COUNT_SENTINEL,
+                width="stretch",
+            )
+            aggregation = "count" if selected_measure == COUNT_SENTINEL else aggregation
+            widget_keys.append(f"analytics_aggregation_{dash_key}")
+        with role_cols[3]:
+            selected_dimension = _selectbox_with_default(
+                "Primary segment",
+                dimension_options,
+                roles["default_dimensions"][0] if roles["default_dimensions"] else "No segment",
+                f"analytics_dimension_{dash_key}",
+                help="Used for the main category comparison and top-segment KPI.",
+            )
+            widget_keys.append(f"analytics_dimension_{dash_key}")
+
+        filter_cols = st.columns([1.3, 1.5, 0.85])
+        date_range_to_apply: tuple[date, date] | None = None
+        if selected_date != "No date field" and selected_date in prepared_df.columns:
+            valid_dates = pd.to_datetime(prepared_df[selected_date], errors="coerce").dropna()
+            if not valid_dates.empty:
+                min_date = valid_dates.min().date()
+                max_date = valid_dates.max().date()
+                date_key = f"analytics_date_range_{dash_key}"
+                _set_widget_default(date_key, (min_date, max_date))
+                with filter_cols[0]:
+                    selected_range = st.date_input(
+                        "Date range",
+                        min_value=min_date,
+                        max_value=max_date,
+                        key=date_key,
+                        format="YYYY-MM-DD",
                     )
-    else:
-        st.info("No dashboard charts were generated for the current filtered view.")
+                widget_keys.append(date_key)
+                if isinstance(selected_range, tuple) and len(selected_range) == 2 and selected_range != (min_date, max_date):
+                    date_range_to_apply = selected_range
+            else:
+                with filter_cols[0]:
+                    st.caption("Selected date field has no valid dates.")
+        else:
+            with filter_cols[0]:
+                st.caption("No date filter available.")
 
-    st.markdown("#### Recommendations")
-    recommendations = insights.get("recommendations", [])
-    if recommendations:
-        st.dataframe(pd.DataFrame(recommendations), width="stretch", height=300)
+        with filter_cols[1]:
+            search_key = f"analytics_search_{dash_key}"
+            search_text = st.text_input(
+                "Search records",
+                key=search_key,
+                placeholder="Search text fields in the dashboard view",
+                help="Search is applied consistently to KPIs, charts, preview, and downloads.",
+            )
+            widget_keys.append(search_key)
+
+        categorical_filters: dict[str, list[str]] = {}
+        with filter_cols[2]:
+            with st.popover("Segment filters", icon=":material/filter_list:", width="stretch"):
+                filter_columns = []
+                if selected_dimension != "No segment":
+                    filter_columns.append(selected_dimension)
+                filter_columns.extend([column for column in roles["dimension_candidates"] if column not in filter_columns])
+                for column in filter_columns[:4]:
+                    values = prepared_df[column].dropna().astype(str).value_counts().head(100).index.tolist()
+                    filter_key = f"analytics_filter_{dash_key}_{column}"
+                    widget_keys.append(filter_key)
+                    selected_values = _multiselect_with_default(
+                        f"Filter {column}",
+                        values,
+                        filter_key,
+                        placeholder="All values",
+                    )
+                    if selected_values:
+                        categorical_filters[column] = selected_values
+
+            st.button(
+                "Reset filters",
+                icon=":material/restart_alt:",
+                width="stretch",
+                key=f"analytics_reset_{dash_key}",
+                on_click=_reset_widget_keys,
+                args=(tuple(widget_keys),),
+            )
+
+        st.caption(
+            f"Inferred {len(roles['measure_candidates'])} safe measure(s), {len(roles['dimension_candidates'])} segment field(s), "
+            f"and {len(roles['date_candidates'])} date field(s). Native dashboard calculations use the cleaned local dataset."
+        )
+
+    date_column = selected_date if selected_date != "No date field" else None
+    measure = selected_measure if selected_measure != COUNT_SENTINEL else None
+    primary_dimension = selected_dimension if selected_dimension != "No segment" else None
+    filtered, filter_meta = apply_dashboard_filters(
+        prepared_df,
+        date_column=date_column,
+        date_range=date_range_to_apply,
+        categorical_filters=categorical_filters,
+        search_text=search_text,
+    )
+    source_filtered = df.loc[filtered.index.intersection(df.index)].copy()
+
+    if filter_meta["active_filters"]:
+        st.markdown(":blue-badge[Active filters]")
+        st.caption(" | ".join(filter_meta["active_filters"]))
     else:
-        st.info("No recommendations passed the evidence threshold.")
+        st.caption("No active filters. Showing all records in the current cleaned dataset.")
+    for warning in filter_meta["warnings"]:
+        st.warning(warning, icon=":material/warning:")
+
+    kpis = build_dashboard_kpis(
+        prepared_df,
+        filtered,
+        measure=measure,
+        aggregation=aggregation,
+        date_column=date_column,
+        primary_dimension=primary_dimension,
+    )
+    _render_kpi_cards(kpis)
+
+    metric_label = aggregation_label(measure, aggregation)
+    trend = trend_data(filtered, date_column, measure, aggregation)
+    category = category_data(filtered, primary_dimension, measure, aggregation)
+
+    main_left, main_right = st.columns([1.65, 1])
+    with main_left:
+        with st.container(border=True):
+            st.markdown("**Trend over time**")
+            if not trend.empty:
+                _render_trend_chart(trend, metric_label)
+                st.caption(f"Formula: {metric_label}. Date field: {date_column}.")
+            else:
+                st.caption("Add or select a valid date field with at least two dated records to show a trend.")
+    with main_right:
+        with st.container(border=True):
+            st.markdown("**Segment comparison**")
+            if not category.empty and primary_dimension:
+                _render_category_chart(category, primary_dimension, metric_label)
+                st.caption(f"Top {len(category)} {primary_dimension} segments sorted by {metric_label.lower()}.")
+            else:
+                st.caption("Select a categorical segment field to compare groups.")
+
+    secondary_cards: list[tuple[str, str]] = []
+    distribution, distribution_sampled = distribution_data(filtered, measure)
+    if not distribution.empty and measure:
+        secondary_cards.append(("Distribution", "distribution"))
+    numeric_for_scatter = [column for column in roles["measure_candidates"] if column != measure]
+    scatter, scatter_sampled = scatter_data(filtered, measure, numeric_for_scatter[0] if measure and numeric_for_scatter else None)
+    if not scatter.empty and measure and numeric_for_scatter:
+        secondary_cards.append(("Relationship check", "scatter"))
+    missing = missing_data(filtered)
+    if not missing.empty:
+        secondary_cards.append(("Missing values", "missing"))
+
+    if secondary_cards:
+        secondary_cols = st.columns(min(len(secondary_cards), 2))
+        for column, (title, card_type) in zip(secondary_cols, secondary_cards[:2]):
+            with column:
+                with st.container(border=True):
+                    st.markdown(f"**{title}**")
+                    if card_type == "distribution" and measure:
+                        _render_distribution_chart(distribution, measure, distribution_sampled)
+                    elif card_type == "scatter" and measure and numeric_for_scatter:
+                        _render_scatter_chart(scatter, measure, numeric_for_scatter[0], scatter_sampled)
+                    elif card_type == "missing":
+                        _render_missing_chart(missing)
+
+    insights = build_dashboard_insights(
+        filtered,
+        measure=measure,
+        aggregation=aggregation,
+        date_column=date_column,
+        primary_dimension=primary_dimension,
+    )
+    with st.container(border=True):
+        st.markdown("**Compact insights**")
+        insight_cols = st.columns(3)
+        with insight_cols[0]:
+            st.caption("Observations")
+            for item in insights["observations"]:
+                st.write(f"- {item}")
+        with insight_cols[1]:
+            st.caption("Suggested actions")
+            for item in insights["actions"]:
+                st.write(f"- {item}")
+        with insight_cols[2]:
+            st.caption("Reliability notes")
+            for item in insights["caveats"]:
+                st.write(f"- {item}")
+
+    with st.expander("Detailed filtered records", expanded=False, icon=":material/table_chart:"):
+        st.caption(
+            f"Preview shows up to 1,000 filtered records and can be sorted in the table. Download contains all {len(source_filtered):,} filtered records."
+        )
+        preview = source_filtered.head(1000)
+        mask_enabled = os.getenv("INSIGHTFORGE_MASK_SENSITIVE_PREVIEWS", "true").lower() != "false"
+        sensitive_columns = list((profile or {}).get("sensitive_columns", {}).keys())
+        if sensitive_columns and mask_enabled:
+            preview = mask_sensitive_preview(preview, sensitive_columns)
+            st.caption(f"Masked preview columns: {', '.join(sensitive_columns)}")
+        st.dataframe(preview, width="stretch", height=380, hide_index=True)
+        st.download_button(
+            "Download filtered CSV",
+            dataframe_to_csv_bytes(source_filtered),
+            "insightforge_filtered_dashboard_records.csv",
+            "text/csv",
+            icon=":material/download:",
+            width="stretch",
+        )
+
+    _render_powerbi_panel(str(dataset_name), roles, dash_key)
 
     navigation_controls(back_enabled=True, next_enabled=True)
 

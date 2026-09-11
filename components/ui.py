@@ -30,8 +30,8 @@ STEP_META = [
     ),
     (
         "monitoring",
-        "Explore Dashboard",
-        "Explore charts and filtered dashboard views.",
+        "Analytical Dashboard",
+        "Explore KPIs, filters, trends, and report views.",
     ),
     (
         "download",

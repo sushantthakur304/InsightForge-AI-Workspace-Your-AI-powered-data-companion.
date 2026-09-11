@@ -88,3 +88,21 @@ def test_upload_can_save_to_permanent_dataset_library(tmp_path, monkeypatch):
     assert app.session_state["active_storage_record_id"] == records[0].id
     assert len(records) == 1
     assert records[0].file_name == "messy_sales_data.csv"
+
+
+def test_analytical_dashboard_renders_with_uploaded_data():
+    project_root = Path(__file__).resolve().parents[1]
+    app_path = project_root / "app.py"
+    csv_path = project_root / "sample_data" / "messy_sales_data.csv"
+
+    app = AppTest.from_file(str(app_path), default_timeout=25).run()
+    app.toggle(key="save_upload_permanently").set_value(False).run()
+    app.file_uploader[0].upload(csv_path.name, csv_path.read_bytes(), "text/csv").run()
+    app.button(key="load_uploaded_dataset").click().run()
+    app.session_state["step"] = 4
+    app.run()
+
+    assert not app.exception
+    assert app.session_state["analysis"] is not None
+    assert app.session_state["analysis_last_processed"] is not None
+    assert any("Power BI is not configured yet" in item.value for item in app.warning)

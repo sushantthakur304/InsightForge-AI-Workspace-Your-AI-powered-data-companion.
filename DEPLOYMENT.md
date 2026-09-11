@@ -12,6 +12,19 @@ InsightForge AI is a Streamlit app, so it should be deployed to a Python app hos
 6. Paste secrets from `.streamlit/secrets.example.toml`, filling `OPENAI_API_KEY` only if you want OpenAI-backed insights.
 7. Deploy the app and copy the generated `streamlit.app` URL.
 
+## Optional Power BI Embedded
+
+The app can embed a real authorized Power BI report when the required server-side settings are configured in Streamlit secrets or environment variables:
+
+- `POWERBI_TENANT_ID`
+- `POWERBI_CLIENT_ID`
+- `POWERBI_CLIENT_SECRET`
+- `POWERBI_WORKSPACE_ID`
+- `POWERBI_REPORT_ID`
+- Optional `POWERBI_DATASET_ID`, `POWERBI_RLS_USERNAME`, `POWERBI_RLS_ROLES`, and `POWERBI_TOKEN_LIFETIME_MINUTES`
+
+Uploaded local datasets are not automatically transferred to Power BI. Build or refresh the Power BI semantic model separately, then configure report embedding in this app. Use workspace permissions and row-level security for private data. Do not use Power BI **Publish to web** for confidential uploaded data because it creates a public unauthenticated report link.
+
 ## Generic Python Hosts
 
 Hosts such as Render, Railway, Heroku-style platforms, and VPS servers can use the included `Procfile`.
